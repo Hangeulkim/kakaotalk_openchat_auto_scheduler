@@ -545,49 +545,6 @@ class KakaoMacroGUI:
         pyautogui.click(win.left + 740, win.top + 955) # 엔터 안 먹힐 대비 클릭 (둘 다 해도 무방)
         self.interruptible_sleep(2.0) # 댓글 달리는 시간 확실히 대기
 
-    def _merge_korean_ascii(self, winocr_word, tess_word):
-        """winocr 한글 + Tesseract 숫자/기호 병합.
-        예: winocr='테스틔', tess='테스트1' → '테스트1'
-        예: winocr='[젬민이병신1', tess='[PA WO SAl' → '[젬민이병신]'
-        """
-        # Tesseract에 숫자가 있고 winocr에 없는 경우:
-        # winocr에서 한글 부분, Tesseract에서 뒷부분(숫자) 가져오기
-        wk_chars = list(winocr_word)
-        ts_chars = list(tess_word)
-
-        # 한글 부분 끝 위치 찾기 (winocr)
-        wk_last_korean = -1
-        for i, c in enumerate(wk_chars):
-            if '\uac00' <= c <= '\ud7a3':
-                wk_last_korean = i
-
-        # Tesseract에서 한글 끝난 이후 부분 찾기
-        ts_last_korean = -1
-        for i, c in enumerate(ts_chars):
-            if '\uac00' <= c <= '\ud7a3':
-                ts_last_korean = i
-
-        if ts_last_korean >= 0 and ts_last_korean < len(ts_chars) - 1:
-            # Tesseract 한글 뒤의 숫자/기호 부분
-            ts_suffix = tess_word[ts_last_korean + 1:]
-            # winocr의 한글 앞부분 (한글 직전까지의 prefix + 한글들)
-            # Tesseract의 한글이 더 정확할 수도 있으므로 Tesseract 한글 부분 사용
-            ts_prefix = tess_word[:ts_last_korean + 1]
-
-            # winocr 한글이 더 많으면 winocr 한글 사용
-            wk_korean_count = sum(1 for c in winocr_word if '\uac00' <= c <= '\ud7a3')
-            ts_korean_count = sum(1 for c in ts_prefix if '\uac00' <= c <= '\ud7a3')
-
-            if wk_korean_count >= ts_korean_count:
-                # winocr 한글 + Tesseract suffix(숫자)
-                # winocr에서 마지막 한글까지 잘라내기
-                wk_prefix = winocr_word[:wk_last_korean + 1]
-                return wk_prefix + ts_suffix
-            else:
-                return tess_word
-        else:
-            # Tesseract에 한글 뒤 숫자가 없으면 winocr 그대로
-            return winocr_word
 
     def run_ocr_and_parse(self):
         win = self.selected_window
@@ -680,7 +637,9 @@ class KakaoMacroGUI:
                 raw_id = m_prefix.group(1)
                 # 흔한 OCR 오타 보정: I/i/l -> 1, O/o -> 0
                 raw_id = raw_id.replace('I', '1').replace('i', '1').replace('l', '1').replace('o', '0').replace('O', '0')
-                if len(raw_id) >= 25:
+                # hex 유효성 검증: 80% 이상이 hex 문자(0-9, a-f)여야 진짜 UUID
+                hex_ratio = sum(1 for c in raw_id.lower() if c in '0123456789abcdef') / max(len(raw_id), 1)
+                if len(raw_id) >= 25 and hex_ratio >= 0.8:
                     item_id = raw_id.lower()
                     self.log(f"  [UUID 감지] id: 접두어 기반 발견: {item_id}")
                     break
@@ -696,18 +655,7 @@ class KakaoMacroGUI:
                     self.log(f"  [UUID 감지] 정규식 기반 발견: {item_id}")
                     break
         
-        if not item_id:
-            # 폴백: 더 관대한 패턴으로 재시도
-            for search_text in [clean_text_en, clean_text]:
-                clean_text_for_id = search_text.replace('-', '').replace(' ', '')
-                uuid_pattern_loose = re.compile(r'([A-Za-z0-9]{25,32})')
-                u_match = uuid_pattern_loose.search(clean_text_for_id)
-                if u_match:
-                    raw_id = u_match.group(1)
-                    raw_id = raw_id.replace('O', '0').replace('o', '0').replace('I', '1').replace('l', '1')
-                    item_id = raw_id.lower()
-                    self.log(f"  [UUID 감지] 느슨한 정규식 발견: {item_id}")
-                    break
+
         
         if not item_id:
             item_id = f"ocr_{hash(clean_text[:30])}"
@@ -983,72 +931,6 @@ class KakaoMacroGUI:
             combined_title = " ".join(item[1] for item in title_parts)
 
             if combined_title and len(combined_title) >= 2:
-                # --- Tesseract 한글 보정 (winocr가 '협'→'리' 등 오인식하는 문제) ---
-                try:
-                    import pytesseract
-                    from PIL import ImageOps, ImageEnhance
-                    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-
-                    crop_top = max(0, int(title_y - 25))
-                    crop_bottom = min(screenshot.height, int(title_y + 25))
-                    title_crop = screenshot.crop((20, crop_top, 770, crop_bottom))
-                    
-                    # --- 이미지 전처리 강화 ---
-                    # 1. 2배 확대 (인식률 향상에 가장 효과적)
-                    title_crop = title_crop.resize((title_crop.width * 2, title_crop.height * 2), Image.Resampling.LANCZOS)
-                    # 2. 대비 향상 (글자를 더 뚜렷하게)
-                    enhancer = ImageEnhance.Contrast(title_crop)
-                    title_crop = enhancer.enhance(2.0)
-                    # 3. 여백 추가
-                    title_crop = ImageOps.expand(title_crop, border=20, fill='white')
-
-                    tess_title = pytesseract.image_to_string(
-                        title_crop, lang='kor', config='--psm 7 --dpi 300'
-                    ).strip()
-                    self.log(f"  [Tesseract 보정] {tess_title}")
-
-                    # 단어별 교체: WinOCR 결과가 부실한 경우에만 Tesseract로 보완
-                    if tess_title:
-                        wk_words = combined_title.split()
-                        ts_words = tess_title.split()
-                        merged = []
-                        ts_idx = 0
-                        for wk in wk_words:
-                            # 1. 한글이 포함된 경우: WinOCR이 이미 잘 읽었다면 우선 (예: 초심자교육)
-                            has_kr = any('\uac00' <= c <= '\ud7a3' for c in wk)
-                            has_en_num = any(c.isalnum() for c in wk)
-                            
-                            if has_kr:
-                                # WinOCR이 이미 한글을 잘 읽었다면(2글자 이상 등) 그대로 유지
-                                # 단, 숫자나 기호가 섞여있어 부자연스러운 경우에만 Tesseract 참고
-                                if len(wk) >= 2 and not re.search(r'[0-9!@#$%^&*()]', wk):
-                                    merged.append(wk)
-                                    if ts_idx < len(ts_words): ts_idx += 1
-                                    continue
-                            
-                            # 2. 영문/숫자인 경우: WinOCR이 이미 잘 읽었다면(File 등) 그대로 유지
-                            if not has_kr and has_en_num:
-                                if len(wk) >= 3: # 3글자 이상 영문/숫자면 신뢰 (File, 2026 등)
-                                    merged.append(wk)
-                                    if ts_idx < len(ts_words): ts_idx += 1
-                                    continue
-
-                            # 3. 그 외 부실한 결과인 경우 Tesseract와 비교 보완
-                            if ts_idx < len(ts_words):
-                                for ti in range(ts_idx, min(len(ts_words), ts_idx + 3)):
-                                    # Tesseract에 의미 있는 한글/영문이 있으면 채택
-                                    if any(c.isalnum() for c in ts_words[ti]):
-                                        merged.append(ts_words[ti])
-                                        ts_idx = ti + 1
-                                        break
-                                else:
-                                    merged.append(wk)
-                            else:
-                                merged.append(wk)
-                        combined_title = " ".join(merged)
-                except Exception as e:
-                    self.log(f"  [Tesseract 보정 실패] {e}")
-
                 # 후처리 보정
                 # 0. 중국어/한자 OCR 쓰레기 제거 (winocr가 한글을 CJK로 오인식)
                 combined_title = re.sub(r'[\u4e00-\u9fff\u3400-\u4dbf]+', '', combined_title)
